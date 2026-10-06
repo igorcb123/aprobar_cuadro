@@ -10,6 +10,11 @@ AS
     G_lockhandle VARCHAR2(128);
     G_lockname   VARCHAR2(200);
 
+    -- Mantener un unico bloqueo de liquidacion por sesion. La liberacion
+    -- es idempotente: si Oracle informa que la sesion ya no posee el lock
+    -- (resultado 4), se limpia solamente el estado local del paquete.
+    PROCEDURE Pr_Soltar_Bloqueo;
+
     PROCEDURE Pr_Tomar_Bloqueo(Pnucomp NUMBER, Pnucargabon NUMBER,
                                Opexitosa OUT VARCHAR2, Pmensaje OUT VARCHAR2)
     IS
@@ -19,49 +24,72 @@ AS
         Opexitosa := 'N';
         Pmensaje := NULL;
         Lrequested_name := 'CRE:DEVOLUCION:' || Pnucomp || ':' || Pnucargabon;
+
         IF G_lockhandle IS NOT NULL THEN
             IF G_lockname = Lrequested_name THEN
                 Opexitosa := 'S';
-            ELSE
-                Pmensaje := 'La sesion conserva otro bloqueo de liquidacion.';
+                RETURN;
             END IF;
-            RETURN;
+
+            -- Al avanzar a otra solicitud no debe quedar un handle residual
+            -- de la liquidacion anterior.
+            Pr_Soltar_Bloqueo;
+            IF G_lockhandle IS NOT NULL THEN
+                Pmensaje := 'La sesion conserva otro bloqueo de liquidacion que no pudo liberarse.';
+                RETURN;
+            END IF;
         END IF;
+
         G_lockname := Lrequested_name;
         DBMS_LOCK.ALLOCATE_UNIQUE_AUTONOMOUS(
             lockname => G_lockname,
             lockhandle => G_lockhandle,
             expiration_secs => 864000);
+
         Lresultado := DBMS_LOCK.REQUEST(
             lockhandle => G_lockhandle,
             lockmode => DBMS_LOCK.X_MODE,
             timeout => 0,
             release_on_commit => FALSE);
-        IF Lresultado <> 0 THEN
+
+        -- 0 = lock obtenido. 4 = la misma sesion ya posee el lock.
+        IF Lresultado NOT IN (0, 4) THEN
             G_lockhandle := NULL;
+            G_lockname := NULL;
             Opexitosa := 'N';
             Pmensaje := 'La solicitud esta siendo procesada por otra sesion.';
             RETURN;
         END IF;
+
         Opexitosa := 'S';
     EXCEPTION
         WHEN OTHERS THEN
-            G_lockhandle := NULL;
+            -- Intentar limpiar cualquier handle parcial sin ocultar el error.
+            Pr_Soltar_Bloqueo;
             Pmensaje := SUBSTR('No se pudo tomar el bloqueo de liquidacion: ' || SQLERRM, 1, 1000);
     END Pr_Tomar_Bloqueo;
 
     PROCEDURE Pr_Soltar_Bloqueo IS
         Lresultado NUMBER;
     BEGIN
-        IF G_lockhandle IS NOT NULL THEN
-            Lresultado := DBMS_LOCK.RELEASE(G_lockhandle);
+        IF G_lockhandle IS NULL THEN
+            G_lockname := NULL;
+            RETURN;
+        END IF;
+
+        Lresultado := DBMS_LOCK.RELEASE(G_lockhandle);
+
+        -- 0 = liberado correctamente.
+        -- 4 = la sesion ya no posee ese lock; el handle local estaba residual.
+        IF Lresultado IN (0, 4) THEN
             G_lockhandle := NULL;
             G_lockname := NULL;
         END IF;
     EXCEPTION
         WHEN OTHERS THEN
-            G_lockhandle := NULL;
-            G_lockname := NULL;
+            -- Ante un error inesperado conservar el handle evita continuar
+            -- como si la liberacion hubiera sido exitosa.
+            NULL;
     END Pr_Soltar_Bloqueo;
     PROCEDURE Pr_Revertir_Solicitud (Pnucomp         NUMBER,
                                      Pnuserv         NUMBER,
@@ -3513,8 +3541,13 @@ AS
     IS
     BEGIN
         Pr_Soltar_Bloqueo;
-        Opexitosa := 'S';
-        Pmensaje := NULL;
+        IF G_lockhandle IS NULL THEN
+            Opexitosa := 'S';
+            Pmensaje := NULL;
+        ELSE
+            Opexitosa := 'N';
+            Pmensaje := 'No se pudo liberar el bloqueo de liquidacion de la sesion.';
+        END IF;
     EXCEPTION
         WHEN OTHERS THEN
             Opexitosa := 'N';
